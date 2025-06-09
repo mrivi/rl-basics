@@ -9,12 +9,12 @@ from collections import deque
 import matplotlib.pyplot as plt
 from datetime import datetime
 import random
+import argparse
 
 LOG_STD_MIN = -20
 LOG_STD_MAX = 2
 
 def set_seed(seed=789):
-    """Set seeds for reproducibility"""
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -199,7 +199,7 @@ def evaluate_agent(agent, env, device, num_episodes=5):
     total_reward = 0
     
     for _ in range(num_episodes):
-        state = env.reset()[0]
+        state, _ = env.reset()
         state = torch.tensor(state, dtype=torch.float32).to(device)
         episode_reward = 0
         done = False
@@ -215,13 +215,34 @@ def evaluate_agent(agent, env, device, num_episodes=5):
             state = torch.tensor(state, dtype=torch.float32).to(device)
         
         total_reward += episode_reward
+        print(f"Episode reward {episode_reward}, last reward {reward}")
     
     return total_reward / num_episodes
 
-                
+def test_model(model, n_episodes=5):
+    env = gym.make('LunarLanderContinuous-v3', render_mode="human")
+
+    action_dim = env.action_space.shape[0]
+    state_dim = env.observation_space.shape[0]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-if __name__ == '__main__':
+    print(f"Dimensions state {state_dim} actions {action_dim}")
+    agent = Agent(state_dim, action_dim)
+
+    if isinstance(model, str):
+        agent.actor.load_state_dict(torch.load(model))
+
+    agent.actor.eval()
+
+    avg_reward = evaluate_agent(agent, env, device)
+
+    env.close()
+
+    return avg_reward
+
+def train_model():
+
     env = gym.make("LunarLanderContinuous-v3")
     num_actions = env.action_space.shape[0]
     state_space = env.observation_space.shape[0]
@@ -235,27 +256,26 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     agent = Agent(state_space, num_actions)
-    state = env.reset()[0]
+    state, _ = env.reset()
     state = torch.tensor(state, dtype=torch.float32).to(device)
 
-    print(state)
-
     total_steps = 0
-    reward_log = []
     max_num_steps = 300000
     warmup_steps = 10000
     eval_freq = 5000
-    print(f"max_num_steps {max_num_steps}")
     episode_reward = 0
     episode_count = 0
 
-    loss_actor_history = []
-    loss_q1_history = []
-    loss_q2_history = []
-    q1_history = []
-    q2_history = []
-    alpha_history = []
-    entropy_history = []
+    logs = {
+        "reward": [],
+        "loss_actor": [],
+        "loss_q1": [],
+        "loss_q2": [],
+        "q1": [],
+        "q2": [],
+        "alpha": [],
+        "entropy": []
+    }
 
     while total_steps < (max_num_steps):
         
@@ -281,24 +301,25 @@ if __name__ == '__main__':
 
         if total_steps > warmup_steps:
             loss_actor, loss_q1, loss_q2, q1, q2, alpha, entropy = agent.train()
-            loss_actor_history.append(loss_actor)
-            loss_q1_history.append(loss_q1)
-            loss_q2_history.append(loss_q2)
-            q1_history.append(q1)
-            q2_history.append(q2)
-            alpha_history.append(alpha)
-            entropy_history.append(entropy)
+            logs["loss_actor"].append(loss_actor)
+            logs["loss_q1"].append(loss_q1)
+            logs["loss_q2"].append(loss_q2)
+            logs["q1"].append(q1)
+            logs["q2"].append(q2)
+            logs["alpha"].append(alpha)
+            logs["entropy"].append(entropy)
+        
 
         if done:
             episode_count +=1 
-            reward_log.append(episode_reward)
+            logs["reward"].append(episode_reward)
             state = env.reset()[0]
             state = torch.tensor(state, dtype=torch.float32).to(device)
             episode_reward = 0
 
         
-            if len(reward_log) > 0:
-                print(f"Episode: {episode_count}, Steps: {total_steps}, Reward avg: {np.mean(reward_log[-10:]):.2f}, Reward max: {np.max(reward_log[-10:]):.2f} ")
+            if len(logs["reward"]) > 0:
+                print(f"Episode: {episode_count}, Steps: {total_steps}, Reward avg: {np.mean(logs['reward'][-10:]):.2f} +-: {np.std(logs['reward'][-10:]):.2f} ")
 
         if total_steps % eval_freq == 0 and total_steps > warmup_steps:
             eval_reward = evaluate_agent(agent, env, device)
@@ -309,34 +330,37 @@ if __name__ == '__main__':
     filename = f"sac_{timestamp}.pt"
     torch.save(agent.actor.state_dict(), filename)
 
+    return logs
 
+def plot_debug_info(logs):
+    
     plt.figure(figsize=(15, 10))
 
     # 1. Alpha (Entropy Coefficient)
     plt.subplot(3, 2, 1)
-    plt.plot(alpha_history)
+    plt.plot(logs["alpha"])
     plt.title("Alpha (Entropy Coefficient)")
     plt.grid()
 
     # 2. Policy Entropy
     plt.subplot(3, 2, 2)
-    plt.plot(entropy_history)
+    plt.plot(logs["entropy"])
     plt.title("Policy Entropy")
     plt.grid()
 
     # 3. Q-values
     plt.subplot(3, 2, 3)
-    plt.plot(q1_history, label='Q1')
-    plt.plot(q2_history, label='Q2')
+    plt.plot(logs["q1"], label='Q1')
+    plt.plot(logs["q2"], label='Q2')
     plt.title("Q-values")
     plt.legend()
     plt.grid()
 
     # 4. Losses
     plt.subplot(3, 2, 4)
-    plt.plot(loss_actor_history, label='Actor Loss')
-    plt.plot(loss_q1_history, label='Critic1 Loss')
-    plt.plot(loss_q2_history, label='Critic2 Loss')
+    plt.plot(logs["loss_actor"], label='Actor Loss')
+    plt.plot(logs["loss_q1"], label='Critic1 Loss')
+    plt.plot(logs["loss_q2"], label='Critic2 Loss')
     plt.title("Losses")
     plt.legend()
     plt.grid()
@@ -344,16 +368,36 @@ if __name__ == '__main__':
     # 5. Episode Reward
     window_size = 100
     plt.subplot(3, 2, 5)
-    plt.plot(reward_log, label='Reward')
-    moving_avg = np.convolve(reward_log, np.ones(window_size)/window_size, mode='valid')
+    plt.plot(logs["reward"], label='Reward')
+    moving_avg = np.convolve(logs["reward"], np.ones(window_size)/window_size, mode='valid')
     plt.plot(moving_avg, label='Smoothed Reward')
     plt.title("Episode Reward")
     plt.xlabel("Episode")
     plt.grid()
 
     plt.tight_layout()
+    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
     save_path = f"sac_graphs_{timestamp}.png"
     plt.savefig(save_path)
 
-    test_model(agent)
-    
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser(description="PPO algorithm implementation")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-t", "--train", action="store_true", help="Run training")
+    group.add_argument("-i", "--infer", action="store_true", help="Run inference")
+    parser.add_argument("--model_file", type=str, default="ppo.pt", help="The model weigths")
+    args = parser.parse_args()
+
+    if args.train:
+        print("Running in training mode.")
+        logs = train_model()
+        plot_debug_info(logs)
+    elif args.infer:
+        print("Running in inference mode.")
+        print(f"Loading {args.model_file} model")
+        avg_reward = test_model(args.model_file)
+        print(f"Average reward during test {avg_reward}")
+    else:
+        print("Please specify a mode with -t (train) or -i (infer).")
