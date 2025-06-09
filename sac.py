@@ -7,9 +7,21 @@ import gymnasium as gym
 import copy
 from collections import deque
 import matplotlib.pyplot as plt
+from datetime import datetime
+import random
 
 LOG_STD_MIN = -20
 LOG_STD_MAX = 2
+
+def set_seed(seed=789):
+    """Set seeds for reproducibility"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 class ReplayBuffer:
     def __init__(self, max_size=1e6):
@@ -214,6 +226,8 @@ if __name__ == '__main__':
     num_actions = env.action_space.shape[0]
     state_space = env.observation_space.shape[0]
 
+    set_seed()
+
     print(f"num_actions {num_actions}")
     print(f"state_space {state_space}")
     print(f"action space min {env.action_space.low} max {env.action_space.high}")
@@ -291,7 +305,9 @@ if __name__ == '__main__':
             print(f"Evaluation at step {total_steps}: {eval_reward:.2f}")
 
     env.close()
-    torch.save(agent.actor.state_dict(), "sac_lunar_lander_fix_alpha.pt")
+    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
+    filename = f"sac_{timestamp}.pt"
+    torch.save(agent.actor.state_dict(), filename)
 
 
     plt.figure(figsize=(15, 10))
@@ -336,4 +352,8 @@ if __name__ == '__main__':
     plt.grid()
 
     plt.tight_layout()
-    plt.savefig("sac_debug_metrics_fix_alpha.png")
+    save_path = f"sac_graphs_{timestamp}.png"
+    plt.savefig(save_path)
+
+    test_model(agent)
+    
