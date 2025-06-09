@@ -5,7 +5,6 @@ from torch import nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-import copy
 import random
 from collections import deque
 import numpy as np
@@ -20,7 +19,10 @@ class DQNConfig:
     network_sync_rate: int = 1000
     replay_memory_size: int = 10000
     gamma: float = 0.99
-    n_training_episodes: int = 100000
+    n_training_episodes: int = 150000
+    epsilon_start = 1.0
+    epsilon_end = 0.01
+    epsilon_decay_episodes = 70000
     
 class ActorNetwork(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, hl_dim: int, lr: float):
@@ -59,9 +61,15 @@ class DQN:
     def __init__(self, config: DQNConfig, env_name: str = "FrozenLake-v1", 
                  render_mode: str = "human"):
         self.config = config
+        self.env_name = env_name
 
         self.env = gym.make(env_name, render_mode=render_mode)
-        self.state_dim = self.env.observation_space.shape[0]
+        
+        if hasattr(self.env.observation_space, 'n'):
+            self.state_dim = self.env.observation_space.n
+        else:
+            self.state_dim = self.env.observation_space.shape[0]  # Continuous (MountainCar)
+
         self.action_dim = self.env.action_space.n
 
         print(f"State dim {self.state_dim}, action dim {self.action_dim}")
@@ -77,10 +85,7 @@ class DQN:
 
     def train(self):
 
-        epsilon_start = 1.0
-        epsilon_end = 0.01
-        epsilon = epsilon_start
-        epsilon_decay_episodes = 70000
+        epsilon = self.config.epsilon_start
         step_count = 0
         loss_log = []
         epsilon_log = []
@@ -100,14 +105,14 @@ class DQN:
                     action = self.env.action_space.sample()
                 else:
                     state_tensor = torch.tensor([state]).to(self.policy.device)
-
                     with torch.no_grad():
                         actions = self.policy(state_tensor)
                     action = actions.argmax().item()
 
                 
                 new_state, reward, terminated, truncated,_ = self.env.step(action)
-                reward = reward + 10 * abs(new_state[1]) + (new_state[0] if new_state[0] > 0.25 else 0)
+                if "MountainCar-v0" in self.env_name:
+                    reward = reward + 10 * abs(new_state[1]) + (new_state[0] if new_state[0] > 0.25 else 0)
                 reward_per_episode += reward
                 done = terminated or truncated
 
@@ -135,7 +140,7 @@ class DQN:
                 q_value_log.append(q_value)
                 q_value_target_log.append(q_target_value)
 
-                epsilon = max(epsilon_start - (epsilon_start - epsilon_end) * n_episode / epsilon_decay_episodes, epsilon_end)
+                epsilon = max(self.config.epsilon_start - (self.config.epsilon_start - self.config.epsilon_end) * n_episode / self.config.epsilon_decay_episodes, self.config.epsilon_end)
                 epsilon_log.append(epsilon)
 
                 if step_count % config.network_sync_rate == 0:
@@ -167,7 +172,6 @@ class DQN:
         plt.legend()
         plt.title("Reward per Episode")
         plt.grid()
-        plt.savefig("log_dql.png")
 
         plt.subplot(3, 2, 3)
         plt.plot(epsilon_log, label='Epsilon')
@@ -188,7 +192,7 @@ class DQN:
         plt.title("Gradient Norms")
         plt.grid()
 
-        plt.savefig("log_dql_grad_norm_10.png")
+        plt.savefig("log_dql.png")
 
     def optimize(self, mini_batch, policy_net, target_net):
 
@@ -203,6 +207,7 @@ class DQN:
 
         q_target = reward + (torch.ones(self.config.batch_size).to(self.policy.device) - done) * self.config.gamma * target_net(new_state).max(1)[0].to(dtype=torch.float32)
         q_policy = policy_net(state).gather(1, action.long().unsqueeze(1)).squeeze(1)
+        
         avg_q = q_policy.mean().item()
         avg_q_target = q_target.mean().item()
 
