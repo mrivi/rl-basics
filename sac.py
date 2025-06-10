@@ -14,7 +14,7 @@ import argparse
 LOG_STD_MIN = -20
 LOG_STD_MAX = 2
 
-def set_seed(seed=789):
+def set_seed(seed: int = 789):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -24,13 +24,13 @@ def set_seed(seed=789):
     torch.backends.cudnn.benchmark = False
 
 class ReplayBuffer:
-    def __init__(self, max_size=1e6):
+    def __init__(self, max_size: int = 1e6):
         self.buffer = deque(maxlen=int(max_size))
     
     def add(self, transition):
         self.buffer.append(transition)
     
-    def sample(self, batch_size):
+    def sample(self, batch_size: int):
         indices = np.random.choice(len(self.buffer), batch_size, replace=False)
         return [self.buffer[i] for i in indices]
     
@@ -85,21 +85,33 @@ class CriticNetwork(nn.Module):
     def forward(self, state_action):
         q_value = self.critic(state_action) 
         return q_value
+
+class SACConfig:
+    learning_rate: float = 3e-4
+    batch_size: int = 256
+    gamma: float = 0.99
+    alpha: float = 0.2
+    tau: float = 0.005
+    memory_size: int = 1e6
+    hidden_dim: int = 256
+    n_training_steps: int = 300000
+    n_warmup_steps: int = 10000
+    eval_freq: int = 5000
     
 class Agent:
-    def __init__(self, input_dim, out_dim, learning_rate=3e-4, batch_size=256, gamma=0.99, alpha=0.2, tau=0.005):
-        self.batch_size = batch_size
-        self.gamma = gamma
-        self.tau = tau
+    def __init__(self, input_dim: int, out_dim: int, config: SACConfig):
+        self.batch_size = config.batch_size
+        self.gamma = config.gamma
+        self.tau = config.tau
 
-        self.memory = ReplayBuffer(1e6)
+        self.memory = ReplayBuffer(config.memory_size)
 
-        self.actor = ActorNetwork(input_dim, 256, out_dim * 2, learning_rate)
-        self.critic1 = CriticNetwork((input_dim + out_dim), 256, learning_rate)
-        self.critic2 = CriticNetwork((input_dim + out_dim), 256, learning_rate)
-        self.target1 = CriticNetwork((input_dim + out_dim), 256, learning_rate)
+        self.actor = ActorNetwork(input_dim, config.hidden_dim, out_dim * 2, config.learning_rate)
+        self.critic1 = CriticNetwork((input_dim + out_dim), config.hidden_dim, config.learning_rate)
+        self.critic2 = CriticNetwork((input_dim + out_dim), config.hidden_dim, config.learning_rate)
+        self.target1 = CriticNetwork((input_dim + out_dim), config.hidden_dim, config.learning_rate)
         self.target1.load_state_dict(copy.deepcopy(self.critic1.state_dict()))
-        self.target2 = CriticNetwork((input_dim + out_dim), 256, learning_rate)
+        self.target2 = CriticNetwork((input_dim + out_dim), config.hidden_dim, config.learning_rate)
         self.target2.load_state_dict(copy.deepcopy(self.critic2.state_dict()))
 
         for param in self.target1.parameters():
@@ -109,9 +121,9 @@ class Agent:
 
 
         self.target_entropy = -float(out_dim)
-        self.log_alpha = torch.tensor(np.log(alpha), dtype=torch.float32, 
+        self.log_alpha = torch.tensor(np.log(config.alpha), dtype=torch.float32, 
                                         requires_grad=True, device=self.actor.device)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=learning_rate)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=config.learning_rate)
         self.alpha = self.log_alpha.exp()
 
         self.mse_loss = nn.MSELoss()
@@ -195,7 +207,7 @@ class Agent:
         return loss_actor.item(), loss_q1.item(), loss_q1.item(), q1.mean().item(), q2.mean().item(), self.alpha.detach().item(), -new_action_log_prob_pi.mean().item()
 
 
-def evaluate_agent(agent, env, device, num_episodes=5):
+def evaluate_agent(agent, env, device, num_episodes=5) -> float:
     total_reward = 0
     
     for _ in range(num_episodes):
@@ -219,7 +231,7 @@ def evaluate_agent(agent, env, device, num_episodes=5):
     
     return total_reward / num_episodes
 
-def test_model(model, n_episodes=5):
+def test_model(model, n_episodes=5) -> float:
     env = gym.make('LunarLanderContinuous-v3', render_mode="human")
 
     action_dim = env.action_space.shape[0]
@@ -228,7 +240,7 @@ def test_model(model, n_episodes=5):
 
 
     print(f"Dimensions state {state_dim} actions {action_dim}")
-    agent = Agent(state_dim, action_dim)
+    agent = Agent(state_dim, action_dim, config)
 
     if isinstance(model, str):
         agent.actor.load_state_dict(torch.load(model))
@@ -241,28 +253,27 @@ def test_model(model, n_episodes=5):
 
     return avg_reward
 
-def train_model():
+def train_model(config: SACConfig):
 
     env = gym.make("LunarLanderContinuous-v3")
-    num_actions = env.action_space.shape[0]
-    state_space = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    state_dim = env.observation_space.shape[0]
 
     set_seed()
 
-    print(f"num_actions {num_actions}")
-    print(f"state_space {state_space}")
-    print(f"action space min {env.action_space.low} max {env.action_space.high}")
+    print(f"Dimensions state: {state_dim} actions: {action_dim}")
+    print(f"Action space min {env.action_space.low} max {env.action_space.high}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    agent = Agent(state_space, num_actions)
+    agent = Agent(state_dim, action_dim, config)
     state, _ = env.reset()
     state = torch.tensor(state, dtype=torch.float32).to(device)
 
     total_steps = 0
-    max_num_steps = 300000
-    warmup_steps = 10000
-    eval_freq = 5000
+    # max_num_steps = 300000
+    # warmup_steps = 10000
+    # eval_freq = 5000
     episode_reward = 0
     episode_count = 0
 
@@ -277,10 +288,10 @@ def train_model():
         "entropy": []
     }
 
-    while total_steps < (max_num_steps):
+    while total_steps < (config.n_training_steps):
         
-        if total_steps > warmup_steps:
-            action, action_log_prob, action_mean = agent.actor(state)
+        if total_steps > config.n_warmup_steps:
+            action, _, _ = agent.actor(state)
             action_np = action.cpu().detach().numpy().squeeze()
             if (action_np.any() < -1 or action_np.any() > 1):
                 print(f"Action out of bounds: {action_np}")
@@ -299,7 +310,7 @@ def train_model():
         state = new_state
         total_steps +=1
 
-        if total_steps > warmup_steps:
+        if total_steps > config.n_warmup_steps:
             loss_actor, loss_q1, loss_q2, q1, q2, alpha, entropy = agent.train()
             logs["loss_actor"].append(loss_actor)
             logs["loss_q1"].append(loss_q1)
@@ -321,7 +332,7 @@ def train_model():
             if len(logs["reward"]) > 0:
                 print(f"Episode: {episode_count}, Steps: {total_steps}, Reward avg: {np.mean(logs['reward'][-10:]):.2f} +-: {np.std(logs['reward'][-10:]):.2f} ")
 
-        if total_steps % eval_freq == 0 and total_steps > warmup_steps:
+        if total_steps % config.eval_freq == 0 and total_steps > config.n_warmup_steps:
             eval_reward = evaluate_agent(agent, env, device)
             print(f"Evaluation at step {total_steps}: {eval_reward:.2f}")
 
@@ -390,14 +401,16 @@ if __name__ == '__main__':
     parser.add_argument("--model_file", type=str, default="ppo.pt", help="The model weigths")
     args = parser.parse_args()
 
+    config = SACConfig()
+
     if args.train:
         print("Running in training mode.")
-        logs = train_model()
+        logs = train_model(config)
         plot_debug_info(logs)
     elif args.infer:
         print("Running in inference mode.")
         print(f"Loading {args.model_file} model")
-        avg_reward = test_model(args.model_file)
+        avg_reward = test_model(config, args.model_file)
         print(f"Average reward during test {avg_reward}")
     else:
         print("Please specify a mode with -t (train) or -i (infer).")
