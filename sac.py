@@ -6,7 +6,6 @@ from torch.distributions.categorical import Categorical
 import gymnasium as gym
 
 import numpy as np
-import copy
 from collections import deque
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -29,24 +28,35 @@ def set_seed(seed: int = 789):
     torch.backends.cudnn.benchmark = False
 
 class ReplayBuffer:
-    def __init__(self, max_size: int = 1_000_000):
+    def __init__(self, max_size: int = 1_000_000, state_dim: int = 8, action_dim: int = 2):
         self.buffer = deque(maxlen=int(max_size))
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Pre-allocate pinned memory for faster transfer
+        if torch.cuda.is_available():
+            self.pin_memory = True
+            self.states_tensor = torch.empty((max_size, state_dim), pin_memory=True)
+            self.actions_tensor = torch.empty((max_size, action_dim), pin_memory=True)
+            self.rewards_tensor = torch.empty(max_size, pin_memory=True)
+            self.next_states_tensor = torch.empty((max_size, state_dim), pin_memory=True)
+            self.dones_tensor = torch.empty(max_size, pin_memory=True)
+        else:
+            self.pin_memory = False
     
     def add(self, transition):
         self.buffer.append(transition)
     
     def sample(self, batch_size: int, device: torch.device, state_dim: int, action_dim: int):
         indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-
-        states = np.empty((batch_size, state_dim), dtype=np.float32)
-        actions = np.empty((batch_size, action_dim), dtype=np.float32)
-        rewards = np.empty(batch_size, dtype=np.float32)
-        next_states = np.empty((batch_size, state_dim), dtype=np.float32)
-        dones = np.empty(batch_size, dtype=bool)
-
-        for i, idx in enumerate(indices):
-            states[i], actions[i], rewards[i], next_states[i], dones[i] = self.buffer[idx]
-    
+        
+        # Create a single batch tensor
+        batch = list(zip(*[self.buffer[idx] for idx in indices]))
+        states = np.stack(batch[0]).astype(np.float32)
+        actions = np.stack(batch[1]).astype(np.float32)
+        rewards = np.stack(batch[2]).astype(np.float32)
+        next_states = np.stack(batch[3]).astype(np.float32)
+        dones = np.stack(batch[4]).astype(bool)
+        
+        # Convert to tensors in one go
         return (
             torch.from_numpy(states).to(device),
             torch.from_numpy(actions).to(device),
@@ -54,7 +64,6 @@ class ReplayBuffer:
             torch.from_numpy(next_states).to(device),
             torch.from_numpy(dones).to(device)
         )
-    
     
     def __len__(self):
         return len(self.buffer)
@@ -70,20 +79,18 @@ class ActorNetwork(nn.Module):
             nn.Linear(hl_dim, out_dim)
         )
 
-        self.apply(self._init_weights)
+        # Orthogonal initialization for better training stability
+        for layer in self.actor:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                nn.init.constant_(layer.bias, 0)
+                if layer == self.actor[-1]:  # Last layer
+                    layer.weight.data.uniform_(-3e-3, 3e-3)
+                    layer.bias.data.uniform_(-3e-3, 3e-3)
 
         self.optimizer = optim.Adam(self.parameters(), lr=lr)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
-
-    def _init_weights(self, module):
-        for layer in self.actor:
-            if isinstance(layer, nn.Linear):
-                if layer.out_features == self.actor[-1].out_features:
-                    nn.init.uniform_(layer.weight, -3e-3, 3e-3)
-                else:
-                    nn.init.xavier_uniform_(layer.weight)
-                nn.init.zeros_(layer.bias)
 
     def forward(self, state):
         out = self.actor(state)
@@ -173,7 +180,7 @@ class Agent:
         self.state_action = torch.empty((self.batch_size, input_dim + out_dim), dtype=torch.float32, device=self.actor.device)
 
 
-    def store_transition(self, state, action, reward, new_state, done):
+    def store_transition(self, state: torch.Tensor, action: torch.Tensor, reward: float, new_state: torch.Tensor, done: bool) -> None:
         transition = (
             state.detach().cpu().numpy() if isinstance(state, torch.Tensor) else state,
             action.detach().cpu().numpy() if isinstance(action, torch.Tensor) else action,
@@ -189,7 +196,6 @@ class Agent:
 
     
     def train(self, state_dim: int, action_dim: int) -> dict[str, float]:
-
         if len(self.memory) < self.batch_size:
             return {}
 
@@ -255,7 +261,7 @@ class Agent:
         }
 
 
-def evaluate_agent(agent, env, device, num_episodes=5) -> float:
+def evaluate_agent(agent, env: gym.Env, device: torch.device, num_episodes: int = 5) -> float:
     total_reward = 0
     
     for _ in range(num_episodes):
@@ -279,7 +285,7 @@ def evaluate_agent(agent, env, device, num_episodes=5) -> float:
     
     return total_reward / num_episodes
 
-def test_model(model, config, n_episodes=5) -> float:
+def test_model(model: str | dict[str, torch.Tensor], config : SACConfig) -> float:
     
     set_seed()
 
@@ -304,7 +310,7 @@ def test_model(model, config, n_episodes=5) -> float:
 
     return avg_reward
 
-def train_model(config: SACConfig):
+def train_model(config: SACConfig) -> dict[str, list[float]]:
 
     start_time = time.time()
 
@@ -397,7 +403,7 @@ def train_model(config: SACConfig):
 
     return logs
 
-def plot_debug_info(logs):
+def plot_debug_info(logs: dict[str, list[float]]) -> None:
     
     plt.figure(figsize=(15, 10))
 
@@ -455,7 +461,7 @@ def plot_debug_info(logs):
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser(description="PPO algorithm implementation")
+    parser = argparse.ArgumentParser(description="SAC algorithm implementation")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-t", "--train", action="store_true", help="Run training")
     group.add_argument("-i", "--infer", action="store_true", help="Run inference")
