@@ -180,12 +180,12 @@ class ExpertOracle:
 
 
 # Usage example:
-def setup_expert_oracle(expert_observations, expert_actions):
+def setup_expert_oracle(expert_observations, expert_actions, normalize_features=True):
     """Setup the expert oracle"""
     return ExpertOracle(
         expert_observations, 
         expert_actions,
-        normalize_features=True,
+        normalize_features=normalize_features,
         distance_threshold=None  # Set to filter out very distant neighbors
     )
 
