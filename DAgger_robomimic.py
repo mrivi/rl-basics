@@ -47,31 +47,34 @@ class PolicyNetwork(nn.Module):
 
 
 class MemoryEfficientDataset:
-    def __init__(self, states, actions, max_size=None):
+    def __init__(self, states, actions, normalizer, max_size=None):
         # Keep everything on CPU
-        self.states = np.array(states)
+        self.states = states
         self.actions = np.array(actions)
+        self.normalizer = normalizer
         
         # Limit dataset size if specified
         if max_size and len(self.states) > max_size:
             indices = np.random.choice(len(self.states), max_size, replace=False)
-            self.states = self.states[indices]
+            # self.states = self.states[indices]
+            self.states = [self.states[i] for i in indices]
             self.actions = self.actions[indices]
     
     def __len__(self):
         return len(self.states)
     
     def get_batch(self, indices, device):
-        """Get a batch and move to device"""
-        batch_states = torch.tensor(self.states[indices], dtype=torch.float32).to(device)
-        batch_actions = torch.tensor(self.actions[indices], dtype=torch.long).to(device)
+        batch_states_list = []
+        for idx in indices:
+            normalized_flattened = self.normalizer.flatten_and_normalize(self.states[idx])
+            batch_states_list.append(normalized_flattened)
+        batch_states = torch.stack(batch_states_list).float().to(device)
+        batch_actions = torch.tensor(self.actions[indices], dtype=torch.float32).to(device)
         return batch_states, batch_actions
     
     def add_data(self, new_states, new_actions, max_total_size=50000):
-        """Add new data and optionally limit total size"""
-        self.states = np.concatenate([self.states, new_states])
+        self.states.extend(new_states)
         self.actions = np.concatenate([self.actions, new_actions])
-        
         # Keep only most recent data if too large
         if len(self.states) > max_total_size:
             keep_size = max_total_size
@@ -79,84 +82,161 @@ class MemoryEfficientDataset:
             self.actions = self.actions[-keep_size:]
 
 
-def load_trajectories_npz(load_path="expert_trajectories.npz"):
-    """Load expert trajectories from npz file"""
-    if not os.path.exists(load_path):
-        print(f"File {load_path} not found!")
-        return None, None
+
+class ManualNormalizer:
+    def __init__(self, data):
+        """Compute mean and std from training data"""
+        self.mean = torch.mean(data, dim=0, keepdim=True)
+        self.std = torch.std(data, dim=0, keepdim=True)
+        # Avoid division by zero
+        self.std = torch.clamp(self.std, min=1e-8)
     
-    data = np.load(load_path)
-    states = data['states']
-    actions = data['actions']
-    episode_lengths = data['episode_lengths']
+    def normalize(self, x):
+        return (x - self.mean) / self.std
     
-    print(f"Loaded {len(states)} state-action pairs from {len(episode_lengths)} episodes")
-    print(f"Episode lengths: min={min(episode_lengths)}, max={max(episode_lengths)}, mean={np.mean(episode_lengths):.1f}")
+    def denormalize(self, x_norm):
+        return x_norm * self.std + self.mean
+
+class RobustNormalizer:
+    def __init__(self, data):
+        self.median = torch.median(data, dim=0)[0]
+        # Median Absolute Deviation
+        self.mad = torch.median(torch.abs(data - self.median), dim=0)[0]
+        self.mad = torch.clamp(self.mad, min=1e-8)
     
-    return states, actions
+    def normalize(self, x):
+        return (x - self.median) / self.mad
+
+class StateNormalizer:
+    def __init__(self, states_dict):
+
+        self.normalizers = {}
+        
+        # Collect all observations by key
+        obs_by_key = {}
+        for obs_dict in states_dict:
+            for key, value in obs_dict.items():
+                if key not in obs_by_key:
+                    obs_by_key[key] = []
+                obs_by_key[key].append(value)
+        
+        # Convert to tensors and create normalizers
+        for key, values in obs_by_key.items():
+            data = torch.stack([torch.tensor(v) if not isinstance(v, torch.Tensor) else v 
+                               for v in values])
+            
+            # Choose normalization based on observation type
+            if 'quat' in key:
+                # Quaternions are already normalized, just center them
+                self.normalizers[key] = self._create_centering_normalizer(data)
+            elif 'pos' in key or 'eef' in key:
+                # Positions: use standard normalization
+                self.normalizers[key] = ManualNormalizer(data)
+            elif 'vel' in key:
+                # Velocities: might have different scale, use robust normalization
+                self.normalizers[key] = RobustNormalizer(data)
+            elif 'cos' in key or 'sin' in key:
+                # Trig functions: already bounded [-1,1], minimal normalization
+                self.normalizers[key] = self._create_centering_normalizer(data)
+            else:
+                # Default: standard normalization
+                self.normalizers[key] = ManualNormalizer(data)
+    
+    def _create_centering_normalizer(self, data):
+        """Create a normalizer that only centers (subtracts mean)"""
+        class CenteringNormalizer:
+            def __init__(self, data):
+                self.mean = torch.mean(data, dim=0, keepdim=True)
+            def normalize(self, x):
+                return x - self.mean
+        return CenteringNormalizer(data)
+    
+    def normalize_obs(self, obs_dict):
+        """Normalize a single observation dictionary"""
+        normalized = {}
+        for key, value in obs_dict.items():
+            if key in self.normalizers:
+                tensor_val = torch.tensor(value) if not isinstance(value, torch.Tensor) else value
+                normalized[key] = self.normalizers[key].normalize(tensor_val)
+            else:
+                normalized[key] = value
+        return normalized
+    
+    def flatten_and_normalize(self, obs_dict, feature_weights=None):
+        """Normalize and flatten with optional feature weighting"""
+        normalized = self.normalize_obs(obs_dict)
+        
+        # Define order and weights for your specific observations
+        feature_order = [
+            'object', 'robot0_eef_pos', 'robot0_eef_quat', 'robot0_eef_quat_site',
+            'robot0_gripper_qpos', 'robot0_gripper_qvel', 'robot0_joint_pos',
+            'robot0_joint_pos_cos', 'robot0_joint_pos_sin', 'robot0_joint_vel'
+        ]
+        
+        if feature_weights is None:
+            # Default weights based on importance (see analysis below)
+            feature_weights = {
+                'object': 3.0,              # Object state is crucial
+                'robot0_eef_pos': 2.5,      # End-effector position very important
+                'robot0_eef_quat': 2.0,     # End-effector orientation important
+                'robot0_eef_quat_site': 1.5, # Secondary orientation info
+                'robot0_gripper_qpos': 2.0,  # Gripper state important for manipulation
+                'robot0_gripper_qvel': 1.0,  # Gripper velocity less critical
+                'robot0_joint_pos': 1.5,    # Joint positions moderately important
+                'robot0_joint_pos_cos': 1.0, # Redundant with joint_pos
+                'robot0_joint_pos_sin': 1.0, # Redundant with joint_pos
+                'robot0_joint_vel': 1.2     # Joint velocities somewhat important
+            }
+        
+        flattened_parts = []
+        for key in feature_order:
+            if key in normalized:
+                feature = normalized[key].flatten()
+                weight = feature_weights.get(key, 1.0)
+                weighted_feature = feature * weight
+                flattened_parts.append(weighted_feature)
+        
+        return torch.cat(flattened_parts)
+
 
 def load_expert_dataset(expert_trajectories_files : str) -> tuple:
 
     dataset = {}
     with h5py.File(expert_trajectories_files, 'r') as f:
-        # Load observations
         obs_keys = list(f['data/demo_0/obs'].keys())
+        
+        # Store as list of dictionaries instead of flattened arrays
         dataset['observations'] = []
         dataset['actions'] = []
         dataset['done'] = []
-
 
         # Iterate through all demonstrations
         for demo_key in f['data'].keys():
             demo = f['data'][demo_key]
             
-            # Load observations for this demo and concatenate them
-            demo_obs_list = []
-            for obs_key in sorted(obs_keys):
-                obs_data = demo['obs'][obs_key][:]
-                demo_obs_list.append(obs_data)
-            
-            # Concatenate all observations for this demo along the last axis
-            demo_obs_concatenated = np.concatenate(demo_obs_list, axis=-1)
-            dataset['observations'].append(demo_obs_concatenated)
+            # Load each timestep as a dictionary
+            demo_length = len(demo['obs'][obs_keys[0]][:])
+            for t in range(demo_length):
+                obs_dict = {}
+                for obs_key in sorted(obs_keys):
+                    if obs_key != 'robot0_joint_acc':  # Filter out unwanted keys
+                        obs_dict[obs_key] = demo['obs'][obs_key][t]
+                dataset['observations'].append(obs_dict)
             
             # Load actions for this demo
             actions = demo['actions'][:]
-            dataset['actions'].append(actions)
+            dataset['actions'].extend(actions)
             
-            # Create done tensor for this demo (True at the end of trajectory)
-            demo_length = len(actions)
+            # Create done flags
             done = np.zeros(demo_length, dtype=bool)
-            done[-1] = True  # Mark last step as done
-            dataset['done'].append(done)
+            done[-1] = True
+            dataset['done'].extend(done)
 
-    # Concatenate all demonstrations
-    dataset['observations'] = np.concatenate(dataset['observations'], axis=0)
-    dataset['actions'] = np.concatenate(dataset['actions'], axis=0)
-    dataset['done'] = np.concatenate(dataset['done'], axis=0)
-    
-    # Convert to tensors
-    observations_tensor = torch.tensor(dataset['observations'], dtype=torch.float32)
+    # Convert actions to tensor (observations stay as list of dicts)
     actions_tensor = torch.tensor(dataset['actions'], dtype=torch.float32)
     done_tensor = torch.tensor(dataset['done'], dtype=torch.bool)
     
-    return observations_tensor, actions_tensor, done_tensor
-
-def get_expert_action(obs, expert_obs, expert_actions, k=5):
-    """Get expert action using k-nearest neighbors and averaging"""
-    flatten_obs = flatten_observation(obs)
-    # Find k nearest neighbors
-    distances = np.linalg.norm(expert_obs - flatten_obs, axis=1)
-    k_nearest_idx = np.argpartition(distances, k)[:k]
-    
-    # Weight actions by inverse distance
-    weights = 1 / (distances[k_nearest_idx] + 1e-8)  # avoid division by zero
-    weights = weights / np.sum(weights)  # normalize weights
-
-    
-    # Weighted average of k nearest actions
-    weighted_action = np.sum(expert_actions[k_nearest_idx].cpu().numpy() * weights[:, None], axis=0)
-    return weighted_action
+    return dataset['observations'], actions_tensor, done_tensor
 
 def flatten_observation(obs: dict):
     if isinstance(obs, dict):
@@ -198,19 +278,29 @@ def train(expert_trajectories_file : str):
         use_image_obs=False, 
     )
 
-    states, actions, dones = load_expert_dataset(expert_trajectories_file)
-    print(f"Expert dataset size: {states.shape[0]} {actions.shape[0]}")
+    states_dict, actions, dones = load_expert_dataset(expert_trajectories_file)
+    print(f"Expert dataset size: {len(states_dict)} {actions.shape[0]}")
+
+    normalizer = StateNormalizer(states_dict)
+
+    sample_normalized = normalizer.flatten_and_normalize(states_dict[0])
+    num_states = len(sample_normalized)
     num_actions = actions.shape[1]
-    num_states = states.shape[1]
     print(f"Number of states: {num_states}, number of actions: {num_actions}")
     actor = PolicyNetwork(num_states, num_actions, 512, 256, 1e-4)
     loss_fn = nn.MSELoss()
 
     # Initialize memory-efficient dataset
-    dataset = MemoryEfficientDataset(states, actions, max_size=30000)  # Limit initial size
+    dataset = MemoryEfficientDataset(states_dict, actions, normalizer, max_size=30000)
     print(f"Initial dataset size: {len(dataset)} samples")
 
-    oracle = eo.setup_expert_oracle(states, actions)
+    flattened_states = []
+    for obs_dict in states_dict:
+        flattened_states.append(normalizer.flatten_and_normalize(obs_dict).numpy())
+    flattened_states = torch.tensor(flattened_states)
+    
+    oracle = eo.setup_expert_oracle(flattened_states, actions, normalize_features=False)
+    
 
     n_iterations = 20
     n_episodes = 10
@@ -241,7 +331,7 @@ def train(expert_trajectories_file : str):
             batch_indices = indices[i:i + batch_size]
 
             xb, yb = dataset.get_batch(batch_indices, device)
-            yb = yb.float()  # For MSE loss
+            yb = yb.float()
 
             logits = actor(xb)
             loss = loss_fn(logits, yb)
@@ -279,8 +369,7 @@ def train(expert_trajectories_file : str):
             while not done:
                 # Get action from current policy
                 with torch.no_grad():
-                    state_tensor = torch.tensor(flatten_observation(state), dtype=torch.float32).to(device)
-
+                    state_tensor = normalizer.flatten_and_normalize(state).float().to(device)
                     action_values = actor(state_tensor)
                     action = action_values.squeeze().cpu().numpy()
 
@@ -291,10 +380,11 @@ def train(expert_trajectories_file : str):
                 episode_reward += reward
 
                 # Get expert action for this state
-                action_expert, _ = oracle.get_expert_action(state)
+                normalized_state = normalizer.flatten_and_normalize(state)
+                action_expert, _ = oracle.get_expert_action(normalized_state.unsqueeze(0))
                 
                 # Store new data (keep on CPU)
-                new_states_list.append(flatten_observation(state).copy())
+                new_states_list.append(state.copy())
                 new_actions_list.append(action_expert)
                 
                 state = new_state
@@ -309,7 +399,7 @@ def train(expert_trajectories_file : str):
 
         # Add new data to dataset (with size limiting)
         if new_states_list:
-            dataset.add_data(np.array(new_states_list), np.array(new_actions_list), max_total_size=50000)
+            dataset.add_data(new_states_list, np.array(new_actions_list), max_total_size=50000)
             print(f"Dataset size after adding new data: {len(dataset)}")
 
         print(f"New policy reward mean {np.mean(new_policy_episode_reward):.4f} std {np.std(new_policy_episode_reward):.4f}")
@@ -351,18 +441,6 @@ def train(expert_trajectories_file : str):
     
     plt.tight_layout()
     plt.savefig("dagger_reset2.png")
-
-
-def flatten_trajectories(trajectories):
-    states = []
-    actions = []
-
-    for episode in trajectories:
-        for state, action in episode:
-            states.append(state)
-            actions.append(action)
-
-    return np.array(states), np.array(actions)
 
 
 def test_expert(expert_trajectories_file: str, n_episodes: int = 5):
@@ -440,10 +518,14 @@ def test(model_file: str, expert_trajectories_file: str, n_episodes: int = 5):
         use_image_obs=False, 
     )
 
-    states, actions, dones = load_expert_dataset(expert_trajectories_file)
-    print(f"Expert dataset size: {states.shape[0]} {actions.shape[0]}")
+    states_dict, actions, dones = load_expert_dataset(expert_trajectories_file)
+    print(f"Expert dataset size: {len(states_dict)} {actions.shape[0]}")
+
+    normalizer = StateNormalizer(states_dict)
+
+    sample_normalized = normalizer.flatten_and_normalize(states_dict[0])
+    num_states = len(sample_normalized)
     num_actions = actions.shape[1]
-    num_states = states.shape[1]
     print(f"Number of states: {num_states}, number of actions: {num_actions}")
     actor = PolicyNetwork(num_states, num_actions, 512, 256, 1e-4)
 
@@ -453,17 +535,26 @@ def test(model_file: str, expert_trajectories_file: str, n_episodes: int = 5):
     for ep in range(n_episodes):
         state = env.reset()
         done = False
+        success = False
         total_reward = 0
+        episode_step_count = 0
 
         while not done:
             env.render()
-            state_tensor = torch.tensor(state, dtype=torch.float32).to(actor.device)
+            state_tensor = normalizer.flatten_and_normalize(state).float().to(device)
             with torch.no_grad():
                 action_values = actor(state_tensor)
                 action = action_values.squeeze().cpu().numpy()
 
-            state, reward, done, _ = env.step(action)
+            state, reward, terminated, _ = env.step(action)
+            if reward >= 1.0:
+                reward = 100.0
+                success = True
             total_reward += reward
+
+            episode_step_count += 1
+            truncated = (episode_step_count > 200)
+            done = terminated or success or truncated
 
         print(f"Episode {ep+1}: total reward = {total_reward}")
 
