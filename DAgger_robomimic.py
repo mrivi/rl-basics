@@ -12,6 +12,7 @@ import argparse
 import os
 import gc
 import h5py
+from datetime import datetime
 
 import ppo as ppo
 from stable_baselines3 import PPO
@@ -29,11 +30,17 @@ class PolicyNetwork(nn.Module):
         super().__init__()
         self.policy = nn.Sequential(
             nn.Linear(input_dim, hl1_dim),
+            nn.LayerNorm(hl1_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hl1_dim, hl1_dim),
+            nn.LayerNorm(hl1_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hl1_dim, hl2_dim),
+            nn.LayerNorm(hl2_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hl2_dim, out_dim)
         )
 
@@ -198,6 +205,16 @@ class StateNormalizer:
         
         return torch.cat(flattened_parts)
 
+class WeightedMSELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.action_weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0], dtype=torch.float32, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    
+    def forward(self, predicted_actions, target_actions):
+        # Assuming actions are [x, y, z, rx, ry, rz, gripper]
+        squared_errors = (predicted_actions - target_actions) ** 2
+        weighted_errors = squared_errors * self.action_weights.unsqueeze(0)
+        return weighted_errors.mean()
 
 def load_expert_dataset(expert_trajectories_files : str) -> tuple:
 
@@ -270,6 +287,12 @@ def train(expert_trajectories_file : str):
     env_meta['env_kwargs']['ignore_done'] = False
     env_meta['env_kwargs']['reward_shaping'] = True
 
+    env_meta['object_placement_bounds'] = {
+        'x': [-0.3, 0.3],  # Increase from default
+        'y': [-0.3, 0.3],  # Increase from default
+        'z': [0.8, 0.8],   # Keep height fixed or add small variation
+    }
+
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
         env_name=env_meta['env_name'], 
@@ -288,7 +311,8 @@ def train(expert_trajectories_file : str):
     num_actions = actions.shape[1]
     print(f"Number of states: {num_states}, number of actions: {num_actions}")
     actor = PolicyNetwork(num_states, num_actions, 512, 256, 1e-4)
-    loss_fn = nn.MSELoss()
+    # loss_fn = nn.MSELoss()
+    loss_fn = WeightedMSELoss()
 
     # Initialize memory-efficient dataset
     dataset = MemoryEfficientDataset(states_dict, actions, normalizer, max_size=30000)
@@ -411,7 +435,12 @@ def train(expert_trajectories_file : str):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    torch.save(actor.state_dict(), "dagger_resnet2.pt")
+    # Generate timestamp for filenames
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    model_filename = f"robomimic_{timestamp}.pt"
+    plot_filename = f"robomimic_{timestamp}.png"
+
+    torch.save(actor.state_dict(), model_filename)
 
     # Plotting code remains the same
     plt.figure(figsize=(15, 10))
@@ -440,10 +469,10 @@ def train(expert_trajectories_file : str):
     plt.grid()
     
     plt.tight_layout()
-    plt.savefig("dagger_reset2.png")
+    plt.savefig(plot_filename)
 
 
-def test_expert(expert_trajectories_file: str, n_episodes: int = 5):
+def test_expert(expert_trajectories_file: str, n_episodes: int = 10):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -457,6 +486,12 @@ def test_expert(expert_trajectories_file: str, n_episodes: int = 5):
     env_meta['env_kwargs']['ignore_done'] = False
     env_meta['env_kwargs']['reward_shaping'] = True
 
+    env_meta['object_placement_bounds'] = {
+        'x': [-0.3, 0.3],  # Increase from default
+        'y': [-0.3, 0.3],  # Increase from default
+        'z': [0.8, 0.8],   # Keep height fixed or add small variation
+    }
+
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
         env_name=env_meta['env_name'], 
@@ -465,11 +500,16 @@ def test_expert(expert_trajectories_file: str, n_episodes: int = 5):
         use_image_obs=False, 
     )
 
+    states_dict, actions, dones = load_expert_dataset(expert_trajectories_file)
+    print(f"Expert dataset size: {len(states_dict)} {actions.shape[0]}")
 
-    states, actions, dones = load_expert_dataset(expert_trajectories_file)
-    print(f"Expert dataset size: {states.shape[0]} {actions.shape[0]}")
+    normalizer = StateNormalizer(states_dict)
+    flattened_states = []
+    for obs_dict in states_dict:
+        flattened_states.append(normalizer.flatten_and_normalize(obs_dict).numpy())
+    flattened_states = torch.tensor(flattened_states)
 
-    oracle = eo.setup_expert_oracle(states, actions)
+    oracle = eo.setup_expert_oracle(flattened_states, actions, normalize_features=False)
 
     for ep in range(n_episodes):
         state = env.reset()
@@ -478,9 +518,12 @@ def test_expert(expert_trajectories_file: str, n_episodes: int = 5):
         total_reward = 0
         episode_step_count = 0
 
+        print(state['object'])
+
         while not done:
             env.render()
-            action, _ = oracle.get_expert_action(state)
+            state_tensor = normalizer.flatten_and_normalize(state).float().to(device)
+            action, _ = oracle.get_expert_action(state_tensor)
             state, reward, terminated, _ = env.step(action)
             
             episode_step_count += 1
@@ -510,6 +553,12 @@ def test(model_file: str, expert_trajectories_file: str, n_episodes: int = 5):
     env_meta['env_kwargs']['ignore_done'] = False
     env_meta['env_kwargs']['reward_shaping'] = True
 
+    env_meta['object_placement_bounds'] = {
+        'x': [-0.3, 0.3],  # Increase from default
+        'y': [-0.3, 0.3],  # Increase from default
+        'z': [0.8, 0.8],   # Keep height fixed or add small variation
+    }
+
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
         env_name=env_meta['env_name'], 
@@ -538,6 +587,7 @@ def test(model_file: str, expert_trajectories_file: str, n_episodes: int = 5):
         success = False
         total_reward = 0
         episode_step_count = 0
+        print(state['object'])
 
         while not done:
             env.render()
@@ -565,9 +615,8 @@ if __name__ == '__main__':
     group.add_argument("-t", "--train", action="store_true", help="Run training")
     group.add_argument("-i", "--infer", action="store_true", help="Run inference")
     group.add_argument("-e", "--expert", action="store_true", help="Test expert policy")
-    parser.add_argument("--env", type=str, default="CarRacing-v3", help="Environment name")
     parser.add_argument("--expert_file", type=str, default="/home/martina/src/robomimic/data/lift/ph/low_dim_v15.hdf5", help="Expert trajectories")
-    parser.add_argument("--model_file", type=str, default="dagger_resnet2.pt", help="Model file")
+    parser.add_argument("--model_file", type=str, default="robomimic_2024-01-01_00-00.pt", help="Model file")
 
     args = parser.parse_args()
 
@@ -579,7 +628,6 @@ if __name__ == '__main__':
         test(args.model_file, args.expert_file)
     elif args.expert:
         print("Testing expert policy.")
-        print(f"Environment {args.env}")
         test_expert(args.expert_file)
     else:
         print("Please specify a mode with -t (train) or -i (infer).")
