@@ -18,21 +18,21 @@ import robomimic.utils.obs_utils as ObsUtils
 
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim: int, out_dim: int, hl1_dim: int, hl2_dim: int, lr: float):
+    def __init__(self, input_dim: int, out_dim: int, hl1_dim: int, hl2_dim: int, lr: float, dropout: float = 0.1):
         super().__init__()
         self.policy = nn.Sequential(
             nn.Linear(input_dim, hl1_dim),
             nn.LayerNorm(hl1_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(hl1_dim, hl1_dim),
             nn.LayerNorm(hl1_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(hl1_dim, hl2_dim),
             nn.LayerNorm(hl2_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(hl2_dim, out_dim)
         )
 
@@ -79,8 +79,6 @@ class MemoryEfficientDataset:
             keep_size = max_total_size
             self.states = self.states[-keep_size:]
             self.actions = self.actions[-keep_size:]
-
-
 
 class ManualNormalizer:
     def __init__(self, data):
@@ -248,23 +246,6 @@ def load_expert_dataset(expert_trajectories_files : str) -> tuple:
     
     return dataset['observations'], actions_tensor, done_tensor
 
-def flatten_observation(obs: dict):
-    if isinstance(obs, dict):
-        # Handle dictionary observations
-        flat_obs = []
-        for key in sorted(obs.keys()):
-            # Filter out robot0_joint_acc key
-            if key == 'robot0_joint_acc':
-                continue
-            if 'image' in key:
-                # For images, you might want to use features from your ResNet
-                # or flatten the image
-                flat_obs.append(obs[key].flatten())
-            else:
-                flat_obs.append(obs[key].flatten())
-        return np.concatenate(flat_obs)
-    else:
-        return obs.flatten()
 
 def setup_environment(expert_trajectories_file: str, render: bool = False):
     """Setup and return the environment with proper configuration"""
