@@ -1,29 +1,21 @@
-import gymnasium as gym
+import argparse
+import gc
+from datetime import datetime
 
+import h5py
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch import nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-import torchvision.models as models
 
-import numpy as np
-import matplotlib.pyplot as plt
-import argparse
-import os
-import gc
-import h5py
-from datetime import datetime
 
-import ppo as ppo
-from stable_baselines3 import PPO
-
+import expert_oracle as eo
+from robomimic.config import config_factory
 import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
-from robomimic.config import config_factory
-import h5py
 
-import expert_oracle as eo
 
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim: int, out_dim: int, hl1_dim: int, hl2_dim: int, lr: float):
@@ -249,9 +241,10 @@ def load_expert_dataset(expert_trajectories_files : str) -> tuple:
             done[-1] = True
             dataset['done'].extend(done)
 
-    # Convert actions to tensor (observations stay as list of dicts)
-    actions_tensor = torch.tensor(dataset['actions'], dtype=torch.float32)
-    done_tensor = torch.tensor(dataset['done'], dtype=torch.bool)
+    actions_array = np.array(dataset['actions'])
+    actions_tensor = torch.tensor(actions_array, dtype=torch.float32)
+    done_array = np.array(dataset['done'], dtype=bool)
+    done_tensor = torch.tensor(done_array, dtype=torch.bool)
     
     return dataset['observations'], actions_tensor, done_tensor
 
@@ -273,13 +266,8 @@ def flatten_observation(obs: dict):
     else:
         return obs.flatten()
 
-def train(expert_trajectories_file : str):
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
+def setup_environment(expert_trajectories_file: str, render: bool = False):
+    """Setup and return the environment with proper configuration"""
     config = config_factory(algo_name="bc")
     ObsUtils.initialize_obs_utils_with_config(config)
 
@@ -296,10 +284,21 @@ def train(expert_trajectories_file : str):
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
         env_name=env_meta['env_name'], 
-        render=False, 
+        render=render, 
         render_offscreen=False,
         use_image_obs=False, 
     )
+    
+    return env
+
+def train(expert_trajectories_file : str):
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    env = setup_environment(expert_trajectories_file, render=False)
 
     states_dict, actions, dones = load_expert_dataset(expert_trajectories_file)
     print(f"Expert dataset size: {len(states_dict)} {actions.shape[0]}")
@@ -479,26 +478,7 @@ def test_expert(expert_trajectories_file: str, n_episodes: int = 10):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    config = config_factory(algo_name="bc")
-    ObsUtils.initialize_obs_utils_with_config(config)
-
-    env_meta = FileUtils.get_env_metadata_from_dataset(expert_trajectories_file)
-    env_meta['env_kwargs']['ignore_done'] = False
-    env_meta['env_kwargs']['reward_shaping'] = True
-
-    env_meta['object_placement_bounds'] = {
-        'x': [-0.3, 0.3],  # Increase from default
-        'y': [-0.3, 0.3],  # Increase from default
-        'z': [0.8, 0.8],   # Keep height fixed or add small variation
-    }
-
-    env = EnvUtils.create_env_from_metadata(
-        env_meta=env_meta,
-        env_name=env_meta['env_name'], 
-        render=True, 
-        render_offscreen=False,
-        use_image_obs=False, 
-    )
+    env = setup_environment(expert_trajectories_file, render=True)
 
     states_dict, actions, dones = load_expert_dataset(expert_trajectories_file)
     print(f"Expert dataset size: {len(states_dict)} {actions.shape[0]}")
@@ -546,26 +526,7 @@ def test(model_file: str, expert_trajectories_file: str, n_episodes: int = 5):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    config = config_factory(algo_name="bc")
-    ObsUtils.initialize_obs_utils_with_config(config)
-
-    env_meta = FileUtils.get_env_metadata_from_dataset(expert_trajectories_file)
-    env_meta['env_kwargs']['ignore_done'] = False
-    env_meta['env_kwargs']['reward_shaping'] = True
-
-    env_meta['object_placement_bounds'] = {
-        'x': [-0.3, 0.3],  # Increase from default
-        'y': [-0.3, 0.3],  # Increase from default
-        'z': [0.8, 0.8],   # Keep height fixed or add small variation
-    }
-
-    env = EnvUtils.create_env_from_metadata(
-        env_meta=env_meta,
-        env_name=env_meta['env_name'], 
-        render=True, 
-        render_offscreen=False,
-        use_image_obs=False, 
-    )
+    env = setup_environment(expert_trajectories_file, render=True)
 
     states_dict, actions, dones = load_expert_dataset(expert_trajectories_file)
     print(f"Expert dataset size: {len(states_dict)} {actions.shape[0]}")
