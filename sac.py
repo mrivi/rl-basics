@@ -31,38 +31,21 @@ class ReplayBuffer:
     def __init__(self, max_size: int = 1_000_000, state_dim: int = 8, action_dim: int = 2):
         self.buffer = deque(maxlen=int(max_size))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # Pre-allocate pinned memory for faster transfer
-        if torch.cuda.is_available():
-            self.pin_memory = True
-            self.states_tensor = torch.empty((max_size, state_dim), pin_memory=True)
-            self.actions_tensor = torch.empty((max_size, action_dim), pin_memory=True)
-            self.rewards_tensor = torch.empty(max_size, pin_memory=True)
-            self.next_states_tensor = torch.empty((max_size, state_dim), pin_memory=True)
-            self.dones_tensor = torch.empty(max_size, pin_memory=True)
-        else:
-            self.pin_memory = False
     
     def add(self, transition):
         self.buffer.append(transition)
     
-    def sample(self, batch_size: int, device: torch.device, state_dim: int, action_dim: int):
+    def sample(self, batch_size: int):
         indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        batch = [self.buffer[i] for i in indices]
+        state, action, reward, new_state, done = zip(*batch)
         
-        # Create a single batch tensor
-        batch = list(zip(*[self.buffer[idx] for idx in indices]))
-        states = np.stack(batch[0]).astype(np.float32)
-        actions = np.stack(batch[1]).astype(np.float32)
-        rewards = np.stack(batch[2]).astype(np.float32)
-        next_states = np.stack(batch[3]).astype(np.float32)
-        dones = np.stack(batch[4]).astype(bool)
-        
-        # Convert to tensors in one go
         return (
-            torch.from_numpy(states).to(device),
-            torch.from_numpy(actions).to(device),
-            torch.from_numpy(rewards).to(device),
-            torch.from_numpy(next_states).to(device),
-            torch.from_numpy(dones).to(device)
+            torch.stack(state),
+            torch.stack(action), 
+            torch.tensor(reward, dtype=torch.float32).to(self.device),
+            torch.stack(new_state),
+            torch.tensor(done, dtype=torch.float32).to(self.device)
         )
     
     def __len__(self):
@@ -176,18 +159,10 @@ class Agent:
 
         self.mse_loss = nn.MSELoss()
 
-        self.new_state_action = torch.empty((self.batch_size, input_dim + out_dim), dtype=torch.float32, device=self.actor.device)
-        self.state_action = torch.empty((self.batch_size, input_dim + out_dim), dtype=torch.float32, device=self.actor.device)
-
 
     def store_transition(self, state: torch.Tensor, action: torch.Tensor, reward: float, new_state: torch.Tensor, done: bool) -> None:
-        transition = (
-            state.detach().cpu().numpy() if isinstance(state, torch.Tensor) else state,
-            action.detach().cpu().numpy() if isinstance(action, torch.Tensor) else action,
-            reward,
-            new_state.detach().cpu().numpy() if isinstance(new_state, torch.Tensor) else new_state,
-            done
-        )
+        
+        transition = (state.detach(), action.detach(), reward, new_state.detach(), done)
         self.memory.add(transition)
         
     def soft_update(self, target_net, source_net):
@@ -199,24 +174,24 @@ class Agent:
         if len(self.memory) < self.batch_size:
             return {}
 
-        state, action, reward, new_state, done = self.memory.sample(self.batch_size, self.actor.device, state_dim, action_dim)
+        state, action, reward, new_state, done = self.memory.sample(self.batch_size)
 
         with torch.no_grad():
             new_action, new_action_log_prob, _ = self.actor(new_state)
-            self.new_state_action = torch.cat([new_state, new_action], dim=1)
+            new_state_action = torch.cat([new_state, new_action], dim=1)
 
-            q_target1 = self.target1(self.new_state_action)                    
-            q_target2 = self.target2(self.new_state_action)
+            q_target1 = self.target1(new_state_action)                    
+            q_target2 = self.target2(new_state_action)
 
             min_target = torch.min(q_target1, q_target2)
             scaled_new_action_log_prob = self.alpha * new_action_log_prob
             q_value_target = reward.unsqueeze(dim=1) + self.gamma * (1 - done.float().unsqueeze(dim=1)) * \
                 (min_target - scaled_new_action_log_prob)
 
-        self.state_action = torch.cat([state, action], dim=1)
+        state_action = torch.cat([state, action], dim=1)
 
-        q1 = self.critic1(self.state_action)
-        q2 = self.critic2(self.state_action)
+        q1 = self.critic1(state_action)
+        q2 = self.critic2(state_action)
 
         loss_q1 = self.mse_loss(q1, q_value_target)
         loss_q2 = self.mse_loss(q2, q_value_target)
